@@ -267,10 +267,88 @@ class Parser
   end
 end
 
+# Stage 1: walk the directory tree from the root, building the in-memory Node
+# tree. Network only — never touches the filesystem. Sequential for now
+# (concurrency arrives in a later milestone).
+class Mapper
+  attr_reader :folders, :files, :total_size, :failures
+
+  def initialize(project, http, parser)
+    @project = project
+    @http = http
+    @parser = parser
+    @folders = 0
+    @files = 0
+    @total_size = 0
+    @failures = 0
+  end
+
+  # Build and return the synthetic root Node with the whole tree mapped.
+  # Yields each directory Node right after its page is parsed (progress hook).
+  def map(&on_page)
+    @on_page = on_page
+    root = Node.new(name: @project, type: :d, path: "", timestamp: nil, size: 0, downloads: 0, children: [])
+    walk(root)
+    aggregate(root)
+    # Root timestamp isn't provided by SF; use the newest child's.
+    root.timestamp = root.children.map(&:timestamp).compact.max
+    root
+  end
+
+  private
+
+  def walk(node)
+    begin
+      html = @http.get(Sf.dir_url(@project, node.path))
+      node.children = @parser.parse(html, node.path)
+    rescue Http::Error => e
+      @failures += 1
+      warn "WARN: failed to map #{node.path.empty? ? '(root)' : node.path}: #{e.message}"
+      node.children = []
+    end
+    @on_page&.call(node)
+
+    node.children.each do |child|
+      if child.dir?
+        @folders += 1
+        walk(child)
+      else
+        @files += 1
+        @total_size += child.size
+      end
+    end
+  end
+
+  # Post-order pass: recompute folder size/downloads from their leaves.
+  def aggregate(node)
+    return if node.file?
+
+    node.children.each { |c| aggregate(c) }
+    node.size = node.children.sum(&:size)
+    node.downloads = node.children.sum(&:downloads)
+  end
+end
+
+# Debug helper: indented tree listing.
+def dump_tree(node, depth = 0)
+  puts "#{'  ' * depth}#{node.name}#{node.dir? ? '/' : ''}"
+  node.children.each { |c| dump_tree(c, depth + 1) }
+end
+
 def main(argv)
   config = Options.parse(argv)
-  # Milestone 1: confirm parsing. Later milestones drive the actual download.
-  puts config.to_h.inspect
+  http = Http.new(timeout: config.timeout, sleep: config.sleep)
+  parser = Parser.new(config.project)
+  mapper = Mapper.new(config.project, http, parser)
+
+  start = Time.now
+  # Temporary per-page progress; the StatusBar replaces this in a later milestone.
+  mapper.map { |node| warn "Parsing #{node.path}/" }
+  elapsed = Time.now - start
+
+  puts format("Stage 1: %d folders, %d files, %d bytes in %.1fs%s",
+              mapper.folders, mapper.files, mapper.total_size, elapsed,
+              mapper.failures.positive? ? " (#{mapper.failures} failures)" : "")
 end
 
 main(ARGV) if $PROGRAM_NAME == __FILE__
