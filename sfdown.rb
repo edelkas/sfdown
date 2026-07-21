@@ -6,6 +6,11 @@
 # SF "Files" pages. See CLAUDE.md for the full plan.
 
 require "optparse"
+require "net/http"
+require "uri"
+require "json"
+require "time"
+require "nokogiri"
 
 # Parsed CLI configuration.
 Config = Struct.new(
@@ -64,6 +69,201 @@ module Options
     warn "Error: #{e.message}\n\n"
     warn parser
     exit 1
+  end
+end
+
+# SourceForge URL templates (see DOC.md).
+module Sf
+  BASE = "https://sourceforge.net"
+  DOWNLOADS = "https://downloads.sourceforge.net"
+
+  module_function
+
+  # Percent-encode a single path segment, byte-wise (keeps UTF-8 safe; space -> %20).
+  def encode_segment(name)
+    name.b.gsub(%r{[^A-Za-z0-9\-_.~]}n) { |c| format("%%%02X", c.ord) }
+  end
+
+  def encode_path(path)
+    path.split("/").map { |s| encode_segment(s) }.join("/")
+  end
+
+  # Directory page URL; path is the full path relative to the project root ("" = root).
+  def dir_url(project, path = "")
+    suffix = path.empty? ? "" : "#{encode_path(path)}/"
+    "#{BASE}/projects/#{encode_segment(project)}/files/#{suffix}"
+  end
+
+  # Direct file download URL (redirects to a mirror).
+  def file_url(project, full_path)
+    "#{DOWNLOADS}/project/#{encode_segment(project)}/#{encode_path(full_path)}"
+  end
+end
+
+# One tree entry (folder or file).
+Node = Struct.new(:name, :type, :path, :timestamp, :size, :downloads, :children, keyword_init: true) do
+  def dir? = type == :d
+  def file? = type == :f
+end
+
+# HTTP GET/download with timeout, redirect-following and per-request sleep.
+class Http
+  Error = Class.new(StandardError)
+  MAX_REDIRECTS = 10
+
+  def initialize(timeout: 5, sleep: 0)
+    @timeout = timeout
+    @sleep = sleep
+  end
+
+  # GET url (following redirects), returning the response body.
+  def get(url)
+    with_sleep { with_response(url) { |res| res.body } }
+  end
+
+  # Stream url to dest in chunks (never buffered whole); yields each chunk's bytesize.
+  def download(url, dest)
+    with_sleep do
+      with_response(url) do |res|
+        File.open(dest, "wb") do |f|
+          res.read_body do |chunk|
+            f.write(chunk)
+            yield chunk.bytesize if block_given?
+          end
+        end
+      end
+    end
+  end
+
+  private
+
+  # Sleep once per logical fetch (not per redirect hop).
+  def with_sleep
+    yield
+  ensure
+    sleep(@sleep) if @sleep.positive?
+  end
+
+  def with_response(url, limit = MAX_REDIRECTS, &block)
+    uri = url.is_a?(URI) ? url : URI(url)
+    Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
+                    open_timeout: @timeout, read_timeout: @timeout) do |http|
+      http.request(Net::HTTP::Get.new(uri)) do |res|
+        case res
+        when Net::HTTPRedirection
+          raise Error, "too many redirects for #{url}" if limit <= 0
+
+          return with_response(URI.join(uri.to_s, res["location"]), limit - 1, &block)
+        when Net::HTTPSuccess
+          return block.call(res)
+        else
+          raise Error, "HTTP #{res.code} #{res.message} for #{uri}"
+        end
+      end
+    end
+  end
+end
+
+# Turns a directory page's HTML into child Nodes, merging table rows with
+# the net.sf.files JS object.
+class Parser
+  UNITS = { "b" => 1, "kb" => 1024, "mb" => 1024**2, "gb" => 1024**3, "tb" => 1024**4 }.freeze
+
+  def initialize(project)
+    @project = project
+  end
+
+  # Parse HTML into child Nodes. parent_path is the directory's full path ("" = root).
+  def parse(html, parent_path = "")
+    doc = Nokogiri::HTML(html)
+    meta = extract_metadata(html)
+    doc.css("table#files_list > tbody > tr").filter_map { |row| node_from_row(row, parent_path, meta) }
+  end
+
+  private
+
+  def node_from_row(row, parent_path, meta)
+    name = row["title"].to_s
+    return nil if name.empty?
+
+    type = row["class"].to_s.split.include?("folder") ? :d : :f
+    path = parent_path.empty? ? name : "#{parent_path}/#{name}"
+    info = meta[name] || {}
+
+    Node.new(
+      name: name,
+      type: type,
+      path: path,
+      timestamp: parse_time(row),
+      size: type == :f ? parse_size(cell_text(row, "files_size_h")) : 0,
+      downloads: downloads_for(row, info),
+      children: []
+    )
+  end
+
+  def cell(row, header)
+    row.at_css(%([headers="#{header}"]))
+  end
+
+  def cell_text(row, header)
+    cell(row, header)&.text.to_s.strip
+  end
+
+  def parse_time(row)
+    full = cell(row, "files_date_h")&.at_css("abbr")&.[]("title")
+    full && !full.empty? ? Time.parse(full).utc : nil
+  rescue ArgumentError
+    nil
+  end
+
+  # "1.7 MB" / "602.1 kB" -> bytes (approximate; SF exposes no exact byte count).
+  def parse_size(text)
+    m = text.to_s.match(/([\d.]+)\s*([kmgt]?b|bytes?)/i) or return 0
+
+    unit = m[2].downcase
+    unit = "b" if unit.start_with?("byte")
+    (m[1].to_f * (UNITS[unit] || 1)).round
+  end
+
+  # Prefer the JS object's total downloads; fall back to the HTML weekly count.
+  def downloads_for(row, info)
+    return info["downloads"] if info["downloads"].is_a?(Integer)
+
+    count = cell(row, "files_downloads_h")&.at_css("span.count")&.text
+    count ? count.delete(",").to_i : 0
+  end
+
+  # Extract and JSON-parse the `net.sf.files = { ... }` object literal.
+  def extract_metadata(html)
+    idx = html.index("net.sf.files") or return {}
+    start = html.index("{", idx) or return {}
+    finish = matching_brace(html, start) or return {}
+
+    JSON.parse(html[start..finish])
+  rescue JSON::ParserError
+    {}
+  end
+
+  # Index of the brace matching the one at `start`, honoring string literals.
+  def matching_brace(str, start)
+    depth = 0
+    in_str = false
+    esc = false
+    (start...str.length).each do |i|
+      c = str[i]
+      if in_str
+        if esc then esc = false
+        elsif c == "\\" then esc = true
+        elsif c == '"' then in_str = false
+        end
+      elsif c == '"' then in_str = true
+      elsif c == "{" then depth += 1
+      elsif c == "}"
+        depth -= 1
+        return i if depth.zero?
+      end
+    end
+    nil
   end
 end
 
