@@ -11,6 +11,7 @@ require "uri"
 require "json"
 require "time"
 require "io/console"
+require "fileutils"
 require "nokogiri"
 
 # Parsed CLI configuration.
@@ -333,6 +334,89 @@ class Mapper
   end
 end
 
+# Stage 2: create the local tree and download files. Counters are mutex-guarded
+# so a ticker thread can snapshot progress while workers advance it. Sequential
+# for now (concurrency arrives in a later milestone).
+class Downloader
+  ILLEGAL = /[<>:"\\|?*\x00-\x1f]/.freeze # Windows-illegal chars (per path segment)
+
+  attr_reader :total_files, :total_bytes
+
+  # dest is the project root directory (<output>/<project>).
+  def initialize(project, http, dest, log: ->(m) { warn m })
+    @project = project
+    @http = http
+    @dest = dest
+    @log = log
+    @mutex = Mutex.new
+    @files = []
+    @total_files = 0
+    @total_bytes = 0
+    @files_done = 0
+    @bytes_done = 0
+    @failures = 0
+    @current = ""
+  end
+
+  def files_done = @mutex.synchronize { @files_done }
+  def bytes_done = @mutex.synchronize { @bytes_done }
+  def failures = @mutex.synchronize { @failures }
+  def current = @mutex.synchronize { @current }
+
+  # Create every directory up front and collect the flat file list + totals.
+  def prepare(root)
+    FileUtils.mkdir_p(@dest)
+    each_node(root) do |n|
+      FileUtils.mkdir_p(local_path(n)) if n.dir? && !n.path.empty?
+      @files << n if n.file?
+    end
+    @total_files = @files.size
+    @total_bytes = @files.sum(&:size)
+  end
+
+  def download_all
+    @files.each { |f| download_one(f) }
+  end
+
+  # Apply folder timestamps last, deepest-first — writing files into a directory
+  # bumps its mtime, so folders must be stamped after their contents are final.
+  def apply_folder_times(root)
+    dirs = []
+    each_node(root) { |n| dirs << n if n.dir? }
+    dirs.sort_by { |n| -n.path.count("/") }.each do |n|
+      path = local_path(n)
+      File.utime(n.timestamp, n.timestamp, path) if n.timestamp && File.directory?(path)
+    end
+  end
+
+  private
+
+  def download_one(node)
+    @mutex.synchronize { @current = node.path }
+    dest = local_path(node)
+    @http.download(Sf.file_url(@project, node.path), dest) do |n|
+      @mutex.synchronize { @bytes_done += n }
+    end
+    File.utime(node.timestamp, node.timestamp, dest) if node.timestamp
+    @mutex.synchronize { @files_done += 1 }
+  rescue Http::Error => e
+    @mutex.synchronize { @failures += 1 }
+    @log.call("WARN: failed to download #{node.path}: #{e.message}")
+  end
+
+  def each_node(node, &blk)
+    blk.call(node)
+    node.children.each { |c| each_node(c, &blk) }
+  end
+
+  # Local path for a node; sanitizes each segment for the filesystem.
+  def local_path(node)
+    return @dest if node.path.empty?
+
+    File.join(@dest, *node.path.split("/").map { |s| s.gsub(ILLEGAL, "_") })
+  end
+end
+
 # Human-readable formatting for sizes and durations.
 module Fmt
   module_function
@@ -437,6 +521,50 @@ def stage1_line(mapper, elapsed)
          mapper.folders, mapper.files, Fmt.size(mapper.total_size), Fmt.duration(elapsed))
 end
 
+# Stage-2 analytics line: elapsed is the global (both-stage) time, complemented
+# by an estimated total = elapsed + remaining_bytes / speed.
+def stage2_line(dl, global_elapsed, speed, total_est)
+  format("[2] files: %d/%d | %s/%s | speed: %s/s | elapsed: %s / ~%s",
+         dl.files_done, dl.total_files, Fmt.size(dl.bytes_done), Fmt.size(dl.total_bytes),
+         Fmt.size(speed), Fmt.duration(global_elapsed), Fmt.duration(total_est))
+end
+
+def render_stage2(bar, dl, global_start, stage2_start)
+  now = Time.now
+  s2 = now - stage2_start
+  speed = s2.positive? ? dl.bytes_done / s2 : 0
+  remaining = [dl.total_bytes - dl.bytes_done, 0].max
+  eta = speed.positive? ? remaining / speed : 0
+  bar.update("Fetching #{dl.current}", stage2_line(dl, now - global_start, speed, (now - global_start) + eta))
+end
+
+# Drive stage 2: prepare the tree, download files while a ~1s ticker refreshes
+# the bar, apply folder timestamps, then log the stage summary.
+def run_stage2(downloader, root, bar, global_start)
+  downloader.prepare(root)
+  stage2_start = Time.now
+  ticker = Thread.new do
+    loop do
+      render_stage2(bar, downloader, global_start, stage2_start)
+      sleep 1
+    end
+  end
+
+  downloader.download_all
+  ticker.kill
+  ticker.join
+  render_stage2(bar, downloader, global_start, stage2_start) # final 100% frame
+  downloader.apply_folder_times(root)
+
+  s2 = Time.now - stage2_start
+  avg = s2.positive? ? downloader.bytes_done / s2 : 0
+  summary = format("Stage 2: %d/%d files, %s in %s (avg %s/s)",
+                   downloader.files_done, downloader.total_files,
+                   Fmt.size(downloader.bytes_done), Fmt.duration(s2), Fmt.size(avg))
+  summary += " (#{downloader.failures} failures)" if downloader.failures.positive?
+  bar.log(summary)
+end
+
 def main(argv)
   config = Options.parse(argv)
   http = Http.new(timeout: config.timeout, sleep: config.sleep)
@@ -445,7 +573,7 @@ def main(argv)
   mapper = Mapper.new(config.project, http, parser, log: bar.method(:log))
 
   start = Time.now
-  mapper.map do |node|
+  root = mapper.map do |node|
     bar.update("Parsing #{node.path}/", stage1_line(mapper, Time.now - start))
   end
 
@@ -454,6 +582,13 @@ def main(argv)
                    Fmt.duration(Time.now - start))
   summary += " (#{mapper.failures} failures)" if mapper.failures.positive?
   bar.log(summary)
+
+  unless config.no
+    dest = File.join(config.output, config.project)
+    downloader = Downloader.new(config.project, http, dest, log: bar.method(:log))
+    run_stage2(downloader, root, bar, start)
+  end
+
   bar.finish
 end
 
