@@ -44,6 +44,18 @@ class ParserTest < Minitest::Test
     assert_empty exe.children
   end
 
+  def test_file_hashes_extracted
+    exe = @parser.parse(leaf_html, "7-Zip/26.01").find { |n| n.name == "7z2601-x64.exe" }
+    assert_equal "625e395ad8bd099a311c72e0d8e65d1c3bd6628a", exe.sha1
+    assert_equal "bed0747071a866109d26eced6c7751e0", exe.md5
+  end
+
+  def test_folder_hashes_are_nil
+    folder = @parser.parse(root_html, "").find(&:dir?)
+    assert_nil folder.sha1
+    assert_nil folder.md5
+  end
+
   def test_downloads_uses_js_total_not_weekly
     # JS object says 77515 total; the HTML weekly span.count says 5,444.
     exe = @parser.parse(leaf_html, "7-Zip/26.01").find { |n| n.name == "7z2601-x64.exe" }

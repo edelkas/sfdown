@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-# sfdown — SourceForge project downloader.
+# sfdown - SourceForge project downloader.
 # Clones a project's directory tree and downloads its files by scraping the
 # SF "Files" pages.
 
@@ -9,6 +9,7 @@ require "net/http"
 require "uri"
 require "json"
 require "time"
+require "digest"
 require "io/console"
 require "fileutils"
 require "nokogiri"
@@ -43,7 +44,7 @@ module Sfdown
 
           opts[:concurrent] = v
         end
-        o.on("-m", "--metadata", "Save metadata to disk at project's root (unimplemented)") { opts[:metadata] = true }
+        o.on("-m", "--metadata", "Save metadata to disk at project's root") { opts[:metadata] = true }
         o.on("-n", "--no", "Only fetch directory tree structure and file metadata, not files") { opts[:no] = true }
         o.on("-o", "--output PATH", String, "Path to store project's root (default current dir)") { |v| opts[:output] = v }
         o.on("-t", "--timeout SECS", Integer, "Timeout for each GET request (default 5)") do |v|
@@ -105,7 +106,7 @@ module Sfdown
   end
 
   # One tree entry (folder or file).
-  Node = Struct.new(:name, :type, :path, :timestamp, :size, :downloads, :children, keyword_init: true) do
+  Node = Struct.new(:name, :type, :path, :timestamp, :size, :downloads, :md5, :sha1, :children, keyword_init: true) do
     def dir? = type == :d
     def file? = type == :f
   end
@@ -125,14 +126,14 @@ module Sfdown
       with_sleep { with_response(url) { |res| res.body } }
     end
 
-    # Stream url to dest in chunks (never buffered whole); yields each chunk's bytesize.
+    # Stream url to dest in chunks (never buffered whole); yields each chunk (String).
     def download(url, dest)
       with_sleep do
         with_response(url) do |res|
           File.open(dest, "wb") do |f|
             res.read_body do |chunk|
               f.write(chunk)
-              yield chunk.bytesize if block_given?
+              yield chunk if block_given?
             end
           end
         end
@@ -201,8 +202,14 @@ module Sfdown
         timestamp: parse_time(row),
         size: type == :f ? parse_size(cell_text(row, "files_size_h")) : 0,
         downloads: downloads_for(row, info),
+        md5: presence(info["md5"]),
+        sha1: presence(info["sha1"]),
         children: []
       )
+    end
+
+    def presence(str)
+      str && !str.empty? ? str : nil
     end
 
     def cell(row, header)
@@ -272,7 +279,7 @@ module Sfdown
   end
 
   # Stage 1: walk the directory tree from the root, building the in-memory Node
-  # tree. Network only — never touches the filesystem. Sequential for now
+  # tree. Network only, never touches the filesystem. Sequential for now
   # (concurrency arrives in a later milestone).
   class Mapper
     attr_reader :folders, :files, :total_size, :failures
@@ -357,12 +364,14 @@ module Sfdown
       @files_done = 0
       @bytes_done = 0
       @failures = 0
+      @mismatches = 0
       @current = ""
     end
 
     def files_done = @mutex.synchronize { @files_done }
     def bytes_done = @mutex.synchronize { @bytes_done }
     def failures = @mutex.synchronize { @failures }
+    def mismatches = @mutex.synchronize { @mismatches }
     def current = @mutex.synchronize { @current }
 
     # Create every directory up front and collect the flat file list + totals.
@@ -380,7 +389,7 @@ module Sfdown
       @files.each { |f| download_one(f) }
     end
 
-    # Apply folder timestamps last, deepest-first — writing files into a directory
+    # Apply folder timestamps last, deepest-first, writing files into a directory
     # bumps its mtime, so folders must be stamped after their contents are final.
     def apply_folder_times(root)
       dirs = []
@@ -396,14 +405,33 @@ module Sfdown
     def download_one(node)
       @mutex.synchronize { @current = node.path }
       dest = local_path(node)
-      @http.download(Sf.file_url(@project, node.path), dest) do |n|
-        @mutex.synchronize { @bytes_done += n }
+      algo, expected = expected_hash(node)
+      digest = algo && Digest.const_get(algo).new
+      @http.download(Sf.file_url(@project, node.path), dest) do |chunk|
+        @mutex.synchronize { @bytes_done += chunk.bytesize }
+        digest&.update(chunk)
       end
       File.utime(node.timestamp, node.timestamp, dest) if node.timestamp
+      verify(node, digest.hexdigest, expected) if digest
       @mutex.synchronize { @files_done += 1 }
     rescue Http::Error => e
       @mutex.synchronize { @failures += 1 }
       @log.call("WARN: failed to download #{node.path}: #{e.message}")
+    end
+
+    # Strongest available checksum for integrity verification, or nil.
+    def expected_hash(node)
+      return ["SHA1", node.sha1] if node.sha1 && !node.sha1.empty?
+      return ["MD5", node.md5] if node.md5 && !node.md5.empty?
+
+      nil
+    end
+
+    def verify(node, actual, expected)
+      return if actual.casecmp?(expected)
+
+      @mutex.synchronize { @mismatches += 1 }
+      @log.call("WARN: checksum mismatch for #{node.path} (expected #{expected}, got #{actual})")
     end
 
     def each_node(node, &blk)
@@ -416,6 +444,32 @@ module Sfdown
       return @dest if node.path.empty?
 
       File.join(@dest, *node.path.split("/").map { |s| s.gsub(ILLEGAL, "_") })
+    end
+  end
+
+  # Serializes the Node tree to metadata.json: recursive and filesystem-like,
+  # enough to rebuild the tree and (later) bootstrap stage 2 without re-scraping.
+  module Metadata
+    module_function
+
+    def to_h(node)
+      h = {
+        "name" => node.name,
+        "type" => node.type.to_s,
+        "size" => node.size,
+        "downloads" => node.downloads,
+        "timestamp" => node.timestamp&.strftime("%Y-%m-%d %H:%M:%S UTC")
+      }
+      if node.file?
+        h["md5"] = node.md5 if node.md5
+        h["sha1"] = node.sha1 if node.sha1
+      end
+      h["content"] = node.children.map { |c| to_h(c) }
+      h
+    end
+
+    def write(root, path)
+      File.write(path, JSON.pretty_generate(to_h(root)))
     end
   end
 
@@ -568,6 +622,7 @@ module Sfdown
                        downloader.files_done, downloader.total_files,
                        Fmt.size(downloader.bytes_done), Fmt.duration(s2), Fmt.size(avg))
       summary += " (#{downloader.failures} failures)" if downloader.failures.positive?
+      summary += " (#{downloader.mismatches} checksum mismatches)" if downloader.mismatches.positive?
       bar.log(summary)
     end
 
@@ -589,8 +644,15 @@ module Sfdown
       summary += " (#{mapper.failures} failures)" if mapper.failures.positive?
       bar.log(summary)
 
+      dest = File.join(config.output, config.project)
+      if config.metadata
+        FileUtils.mkdir_p(dest)
+        path = File.join(dest, "metadata.json")
+        Metadata.write(root, path)
+        bar.log("Wrote metadata to #{path}")
+      end
+
       unless config.no
-        dest = File.join(config.output, config.project)
         downloader = Downloader.new(config.project, http, dest, log: bar.method(:log))
         run_stage2(downloader, root, bar, start)
       end

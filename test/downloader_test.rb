@@ -19,7 +19,7 @@ class FakeDlHttp
       data.bytes.each_slice(2) do |slice|
         chunk = slice.pack("C*")
         f.write(chunk)
-        yield chunk.bytesize if block_given?
+        yield chunk if block_given?
       end
     end
   end
@@ -115,5 +115,60 @@ class DownloaderTest < Minitest::Test
     dl = Downloader.new(PROJECT, FakeDlHttp.new({}), "root")
     node = Node.new(name: %(a:b?c), type: :f, path: %(v1/a:b?c), timestamp: nil, size: 0, downloads: 0, children: [])
     assert_equal File.join("root", "v1", "a_b_c"), dl.send(:local_path, node)
+  end
+
+  # --- integrity verification ---
+
+  def one_file_tree(sha1: nil, md5: nil)
+    f = Node.new(name: "a.txt", type: :f, path: "a.txt", timestamp: T_A, size: 5,
+                 downloads: 0, md5: md5, sha1: sha1, children: [])
+    Node.new(name: PROJECT, type: :d, path: "", timestamp: T_ROOT, size: 0, downloads: 0, children: [f])
+  end
+
+  def test_matching_sha1_passes
+    Dir.mktmpdir do |dir|
+      tree = one_file_tree(sha1: Digest::SHA1.hexdigest("hello"))
+      logged = []
+      dl = Downloader.new(PROJECT, FakeDlHttp.new(contents), File.join(dir, PROJECT), log: ->(m) { logged << m })
+      dl.prepare(tree)
+      dl.download_all
+      assert_equal 0, dl.mismatches
+      assert_empty logged
+      assert_equal 1, dl.files_done
+    end
+  end
+
+  def test_mismatched_sha1_warns_and_is_tallied
+    Dir.mktmpdir do |dir|
+      dest = File.join(dir, PROJECT)
+      tree = one_file_tree(sha1: "0" * 40) # wrong
+      logged = []
+      dl = Downloader.new(PROJECT, FakeDlHttp.new(contents), dest, log: ->(m) { logged << m })
+      dl.prepare(tree)
+      dl.download_all
+      assert_equal 1, dl.mismatches
+      assert_equal 1, dl.files_done # file still downloaded, just corrupt
+      assert_match(/checksum mismatch for a\.txt/, logged.first)
+      assert_path_exists File.join(dest, "a.txt")
+    end
+  end
+
+  def test_md5_used_when_sha1_absent
+    Dir.mktmpdir do |dir|
+      tree = one_file_tree(md5: Digest::MD5.hexdigest("hello"))
+      logged = []
+      dl = Downloader.new(PROJECT, FakeDlHttp.new(contents), File.join(dir, PROJECT), log: ->(m) { logged << m })
+      dl.prepare(tree)
+      dl.download_all
+      assert_equal 0, dl.mismatches
+      assert_empty logged
+    end
+  end
+
+  def test_no_hash_skips_verification
+    Dir.mktmpdir do |dir|
+      dl = run_download(one_file_tree, FakeDlHttp.new(contents), File.join(dir, PROJECT))
+      assert_equal 0, dl.mismatches
+    end
   end
 end

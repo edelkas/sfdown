@@ -35,17 +35,25 @@ class LiveTest < Minitest::Test
     assert meta["7-Zip"], "expected 7-Zip entry in net.sf.files"
   end
 
-  def test_direct_download_resolves_and_streams
+  def test_direct_download_resolves_and_verifies_sha1
+    # Fetch the folder page to learn the advertised sha1, then download and
+    # confirm the bytes match it — exercises URL template + integrity end-to-end.
+    html = get(Sf.dir_url(PROJECT, "7-Zip/26.01"))
+    node = @parser.parse(html, "7-Zip/26.01").find { |n| n.name == "7zr.exe" }
+    refute_nil node&.sha1, "no sha1 in net.sf.files for 7zr.exe"
+
     Dir.mktmpdir do |dir|
       dest = File.join(dir, "7zr.exe")
+      digest = Digest::SHA1.new
       bytes = 0
       begin
-        @http.download(Sf.file_url(PROJECT, "7-Zip/26.01/7zr.exe"), dest) { |n| bytes += n }
+        @http.download(Sf.file_url(PROJECT, node.path), dest) { |chunk| digest.update(chunk); bytes += chunk.bytesize }
       rescue *NET_ERRORS => e
         skip "network unavailable: #{e.class}: #{e.message}"
       end
       assert bytes.positive?, "no bytes streamed"
       assert_equal bytes, File.size(dest)
+      assert_equal node.sha1, digest.hexdigest, "downloaded bytes don't match advertised sha1"
     end
   end
 

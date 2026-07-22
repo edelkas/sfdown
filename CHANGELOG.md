@@ -2,7 +2,15 @@
 
 All notable changes to this project are documented here.
 
-## [1.0.0] - 2026-07-22
+## [0.2.0] - TBD
+
+- `-m` metadata writer: writes `metadata.json` (recursive tree with per-entry
+  name/type/size/downloads/timestamp/content) to the project root after stage 1.
+  Files also carry `md5`/`sha1` hash when available.
+- Stage 2 verifies each downloaded file against its checksum (sha1 preferred,
+  else md5) and warns on mismatch, tallied in the stage summary.
+
+## [0.1.0] - 2026-07-22
 
 Initial release.
 
