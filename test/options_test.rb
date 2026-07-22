@@ -52,7 +52,7 @@ class OptionsTest < Minitest::Test
   def test_missing_project_exits_with_banner
     status, err = capture_parse_error([])
     assert_equal 1, status
-    assert_match(/Usage: ruby sfdown\.rb project_name/, err)
+    assert_match(/Usage: sfdown project_name/, err)
   end
 
   def test_extra_positional_exits

@@ -1,10 +1,14 @@
 # frozen_string_literal: true
 
 # Shared setup for all test files.
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+
 require "minitest/autorun"
 require "stringio"
+require "sfdown"
 
-require_relative "../sfdown"
+# Expose the gem's constants unqualified so tests can use Parser, Node, etc.
+include Sfdown
 
 module TestHelpers
   # Run Options.parse expecting the misuse path (banner + non-zero exit).
