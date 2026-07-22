@@ -142,4 +142,15 @@ class MapperTest < Minitest::Test
     assert_equal 4, mapper.files # d.zip is lost
     assert_empty find(find(root, "v2"), "sub").children
   end
+
+  def test_warnings_go_through_injected_logger
+    pages = sample_pages
+    pages.delete(dir("v2/sub"))
+    logged = []
+    http = FakeHttp.new(pages)
+    mapper = Mapper.new(PROJECT, http, Parser.new(PROJECT), log: ->(m) { logged << m })
+    mapper.map
+    assert_equal 1, logged.length
+    assert_match(/failed to map v2\/sub/, logged.first)
+  end
 end

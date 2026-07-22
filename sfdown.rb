@@ -10,6 +10,7 @@ require "net/http"
 require "uri"
 require "json"
 require "time"
+require "io/console"
 require "nokogiri"
 
 # Parsed CLI configuration.
@@ -273,10 +274,13 @@ end
 class Mapper
   attr_reader :folders, :files, :total_size, :failures
 
-  def initialize(project, http, parser)
+  # log: callback for non-fatal diagnostics (defaults to stderr; main routes it
+  # through StatusBar#log so the bar stays pinned at the bottom).
+  def initialize(project, http, parser, log: ->(m) { warn m })
     @project = project
     @http = http
     @parser = parser
+    @log = log
     @folders = 0
     @files = 0
     @total_size = 0
@@ -303,7 +307,7 @@ class Mapper
       node.children = @parser.parse(html, node.path)
     rescue Http::Error => e
       @failures += 1
-      warn "WARN: failed to map #{node.path.empty? ? '(root)' : node.path}: #{e.message}"
+      @log.call("WARN: failed to map #{node.path.empty? ? '(root)' : node.path}: #{e.message}")
       node.children = []
     end
     @on_page&.call(node)
@@ -329,26 +333,128 @@ class Mapper
   end
 end
 
+# Human-readable formatting for sizes and durations.
+module Fmt
+  module_function
+
+  UNITS = %w[B KB MB GB TB].freeze
+
+  def size(bytes)
+    v = bytes.to_f
+    i = 0
+    while v >= 1024 && i < UNITS.size - 1
+      v /= 1024
+      i += 1
+    end
+    i.zero? ? "#{bytes} B" : format("%.1f %s", v, UNITS[i])
+  end
+
+  def duration(secs)
+    return format("%.1fs", secs) if secs < 60
+
+    m, s = secs.round.divmod(60)
+    h, m = m.divmod(60)
+    h.zero? ? format("%dm%02ds", m, s) : format("%dh%02dm%02ds", h, m, s)
+  end
+end
+
+# Two-line status region pinned to the bottom of the terminal, redrawn in
+# place with ANSI. Thread-safe: a mutex serializes updates, logs and teardown
+# so the ticker and log() never interleave. Assumes a VT-capable terminal.
+class StatusBar
+  def initialize(out: $stdout, width: nil)
+    @out = out
+    @width = width
+    @mutex = Mutex.new
+    @top = ""
+    @bottom = ""
+    @drawn = false
+    @out.sync = true
+  end
+
+  # Set both lines and redraw in place.
+  def update(top, bottom)
+    @mutex.synchronize do
+      @top = top
+      @bottom = bottom
+      erase
+      draw
+    end
+  end
+
+  # Print a message above the bar (scrolls into history), then redraw the bar.
+  def log(msg)
+    @mutex.synchronize do
+      erase
+      @out.puts(msg)
+      draw
+    end
+  end
+
+  # Remove the bar entirely (on completion).
+  def finish
+    @mutex.synchronize { erase }
+  end
+
+  private
+
+  # Park the cursor at the region's top-left and clear from there down.
+  def erase
+    return unless @drawn
+
+    @out.print("\r\e[1A\e[J")
+    @drawn = false
+  end
+
+  def draw
+    @out.print("#{truncate(@top)}\n#{truncate(@bottom)}")
+    @drawn = true
+  end
+
+  # Truncate to terminal width so a line never wraps (wrapping corrupts the
+  # up-count on the next redraw).
+  def truncate(line)
+    w = width
+    line.length > w ? line[0, w] : line
+  end
+
+  def width
+    @width || IO.console&.winsize&.last || 80
+  rescue StandardError
+    80
+  end
+end
+
 # Debug helper: indented tree listing.
 def dump_tree(node, depth = 0)
   puts "#{'  ' * depth}#{node.name}#{node.dir? ? '/' : ''}"
   node.children.each { |c| dump_tree(c, depth + 1) }
 end
 
+# Stage-1 analytics line: starts with the stage number, ends with elapsed time.
+def stage1_line(mapper, elapsed)
+  format("[1] folders: %d | files: %d | size: %s | elapsed: %s",
+         mapper.folders, mapper.files, Fmt.size(mapper.total_size), Fmt.duration(elapsed))
+end
+
 def main(argv)
   config = Options.parse(argv)
   http = Http.new(timeout: config.timeout, sleep: config.sleep)
   parser = Parser.new(config.project)
-  mapper = Mapper.new(config.project, http, parser)
+  bar = StatusBar.new
+  mapper = Mapper.new(config.project, http, parser, log: bar.method(:log))
 
   start = Time.now
-  # Temporary per-page progress; the StatusBar replaces this in a later milestone.
-  mapper.map { |node| warn "Parsing #{node.path}/" }
-  elapsed = Time.now - start
+  mapper.map do |node|
+    bar.update("Parsing #{node.path}/", stage1_line(mapper, Time.now - start))
+  end
 
-  puts format("Stage 1: %d folders, %d files, %d bytes in %.1fs%s",
-              mapper.folders, mapper.files, mapper.total_size, elapsed,
-              mapper.failures.positive? ? " (#{mapper.failures} failures)" : "")
+  summary = format("Stage 1: %d folders, %d files, %s total in %s",
+                   mapper.folders, mapper.files, Fmt.size(mapper.total_size),
+                   Fmt.duration(Time.now - start))
+  summary += " (#{mapper.failures} failures)" if mapper.failures.positive?
+  bar.log(summary)
+  bar.finish
 end
 
 main(ARGV) if $PROGRAM_NAME == __FILE__
