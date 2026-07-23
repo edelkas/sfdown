@@ -49,6 +49,17 @@ class OptionsTest < Minitest::Test
     assert_equal 2, c.concurrent
   end
 
+  def test_input_defaults_nil
+    assert_nil Options.parse(["myproject"]).input
+  end
+
+  def test_input_option
+    c = Options.parse(["myproject", "-i", "meta.json"])
+    assert_equal "meta.json", c.input
+    c = Options.parse(["myproject", "--input", "dir/metadata.json"])
+    assert_equal "dir/metadata.json", c.input
+  end
+
   def test_missing_project_exits_with_banner
     status, err = capture_parse_error([])
     assert_equal 1, status

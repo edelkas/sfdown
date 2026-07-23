@@ -59,4 +59,64 @@ class MetadataTest < Minitest::Test
       assert_equal "setup.zip", parsed.dig("content", 0, "content", 0, "name")
     end
   end
+
+  # --- read / bootstrap ---
+
+  def with_written_tree
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "metadata.json")
+      Metadata.write(sample_tree, path)
+      yield path
+    end
+  end
+
+  def test_read_reconstructs_paths
+    with_written_tree do |path|
+      root = Metadata.read(path)
+      assert_equal "", root.path
+      v1 = root.children.first
+      assert_equal "v1.0", v1.path
+      assert_equal "v1.0/setup.zip", v1.children.first.path
+    end
+  end
+
+  def test_read_reconstructs_fields
+    with_written_tree do |path|
+      file = Metadata.read(path).children.first.children.first
+      assert file.file?
+      assert_equal "setup.zip", file.name
+      assert_equal 10, file.size
+      assert_equal 5, file.downloads
+      assert_equal "abc123", file.md5
+      assert_equal "def456", file.sha1
+      assert_equal T_FILE, file.timestamp
+    end
+  end
+
+  def test_read_round_trip_is_structurally_identical
+    with_written_tree do |path|
+      # Writing the re-read tree yields the same document.
+      assert_equal Metadata.to_h(sample_tree), Metadata.to_h(Metadata.read(path))
+    end
+  end
+
+  def test_read_missing_file_raises_enoent
+    assert_raises(Errno::ENOENT) { Metadata.read("does/not/exist.json") }
+  end
+
+  def test_read_invalid_json_raises_parser_error
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "bad.json")
+      File.write(path, "{not json")
+      assert_raises(JSON::ParserError) { Metadata.read(path) }
+    end
+  end
+
+  def test_read_structurally_invalid_raises_metadata_error
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "wrong.json")
+      File.write(path, JSON.generate({ "foo" => "bar" }))
+      assert_raises(Metadata::Error) { Metadata.read(path) }
+    end
+  end
 end

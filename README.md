@@ -13,7 +13,7 @@ gem install sfdown
 Run with:
 
 ```
-sfdown project_name [-mn] [-c concurrent] [-o output] [-t timeout] [-s sleep]
+sfdown project_name [-mn] [-c concurrent] [-i input] [-o output] [-t timeout] [-s sleep]
 ```
 
 Arguments:
@@ -21,6 +21,7 @@ Arguments:
 | Arguments | Default | Description |
 |--|--|--|
 | `-c` or `--concurrent` | 1 | Number of parallel downloads |
+|`-i` or `--input`|None|Bootstrap the download directly from a metadata JSON file, skipping the mapping stage|
 |`-m` or `--metadata`|False|Save metadata to disk at project's root|
 |`-n` or `--no`|False|Only fetch directory tree structure and file metadata, not files|
 |`-o` or `--output`|Current dir|Path to store project's root|

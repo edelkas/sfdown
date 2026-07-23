@@ -171,4 +171,19 @@ class DownloaderTest < Minitest::Test
       assert_equal 0, dl.mismatches
     end
   end
+
+  # Bootstrap: a tree rebuilt from metadata drives stage 2 with correct paths.
+  def test_downloads_from_metadata_reconstructed_tree
+    Dir.mktmpdir do |dir|
+      meta = File.join(dir, "metadata.json")
+      Metadata.write(sample_tree, meta)
+      tree = Metadata.read(meta)
+
+      dest = File.join(dir, PROJECT)
+      dl = run_download(tree, FakeDlHttp.new(contents), dest)
+      assert_equal 2, dl.files_done
+      assert_equal "hello", File.read(File.join(dest, "a.txt"))
+      assert_equal "bin", File.binread(File.join(dest, "v1", "b.bin"))
+    end
+  end
 end

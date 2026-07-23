@@ -19,7 +19,7 @@ require_relative "sfdown/version"
 module Sfdown
   # Parsed CLI configuration.
   Config = Struct.new(
-    :project, :concurrent, :metadata, :no, :output, :timeout, :sleep,
+    :project, :concurrent, :metadata, :no, :input, :output, :timeout, :sleep,
     keyword_init: true
   )
 
@@ -28,6 +28,7 @@ module Sfdown
       concurrent: 1,
       metadata: false,
       no: false,
+      input: nil,
       output: ".",
       timeout: 5,
       sleep: 0.0
@@ -37,14 +38,15 @@ module Sfdown
     def self.parser(opts)
       OptionParser.new do |o|
         o.banner = "Usage: sfdown project_name [-mn] " \
-                   "[-c concurrent] [-o output] [-t timeout] [-s sleep]"
+                   "[-c concurrent] [-i input] [-o output] [-t timeout] [-s sleep]"
 
         o.on("-c", "--concurrent N", Integer, "Number of parallel downloads (default 1) (unimplemented)") do |v|
           raise OptionParser::InvalidArgument, "#{v} (must be >= 1)" if v < 1
 
           opts[:concurrent] = v
         end
-        o.on("-m", "--metadata", "Save metadata to disk at project's root") { opts[:metadata] = true }
+        o.on("-i", "--input PATH", String, "Bootstrap download from a metadata JSON file (skips mapping)") { |v| opts[:input] = v }
+        o.on("-m", "--metadata", "Save metadata JSON file to disk at project's root") { opts[:metadata] = true }
         o.on("-n", "--no", "Only fetch directory tree structure and file metadata, not files") { opts[:no] = true }
         o.on("-o", "--output PATH", String, "Path to store project's root (default current dir)") { |v| opts[:output] = v }
         o.on("-t", "--timeout SECS", Integer, "Timeout for each GET request (default 5)") do |v|
@@ -448,8 +450,10 @@ module Sfdown
   end
 
   # Serializes the Node tree to metadata.json: recursive and filesystem-like,
-  # enough to rebuild the tree and (later) bootstrap stage 2 without re-scraping.
+  # enough to rebuild the tree and bootstrap stage 2 without re-scraping.
   module Metadata
+    Error = Class.new(StandardError)
+
     module_function
 
     def to_h(node)
@@ -470,6 +474,43 @@ module Sfdown
 
     def write(root, path)
       File.write(path, JSON.pretty_generate(to_h(root)))
+    end
+
+    # Rebuild the root Node tree from a metadata file. Paths aren't stored in the
+    # JSON, so they're reconstructed from the tree structure (root path = "").
+    # Raises Metadata::Error on a structurally invalid document; lets
+    # Errno::ENOENT / JSON::ParserError propagate to the caller.
+    def read(file)
+      data = JSON.parse(File.read(file))
+      unless data.is_a?(Hash) && data["name"] && data["type"] == "d"
+        raise Error, "not a valid sfdown metadata document (expected a directory root object)"
+      end
+
+      node_from(data, "")
+    end
+
+    def node_from(h, path)
+      Node.new(
+        name: h["name"],
+        type: h["type"] == "d" ? :d : :f,
+        path: path,
+        timestamp: parse_ts(h["timestamp"]),
+        size: h["size"] || 0,
+        downloads: h["downloads"] || 0,
+        md5: h["md5"],
+        sha1: h["sha1"],
+        children: Array(h["content"]).map { |c| node_from(c, join(path, c["name"])) }
+      )
+    end
+
+    def join(parent, name)
+      parent.empty? ? name.to_s : "#{parent}/#{name}"
+    end
+
+    def parse_ts(str)
+      str && !str.empty? ? Time.parse(str).utc : nil
+    rescue ArgumentError
+      nil
     end
   end
 
@@ -626,14 +667,10 @@ module Sfdown
       bar.log(summary)
     end
 
-    def main(argv)
-      config = Options.parse(argv)
-      http = Http.new(timeout: config.timeout, sleep: config.sleep)
+    # Stage 1: map the tree over the network, logging the summary.
+    def run_stage1(config, http, bar, start)
       parser = Parser.new(config.project)
-      bar = StatusBar.new
       mapper = Mapper.new(config.project, http, parser, log: bar.method(:log))
-
-      start = Time.now
       root = mapper.map do |node|
         bar.update("Parsing #{node.path}/", stage1_line(mapper, Time.now - start))
       end
@@ -643,6 +680,33 @@ module Sfdown
                        Fmt.duration(Time.now - start))
       summary += " (#{mapper.failures} failures)" if mapper.failures.positive?
       bar.log(summary)
+      root
+    end
+
+    # Bootstrap: rebuild the tree from a metadata file instead of mapping.
+    def load_metadata(config, bar)
+      root = Metadata.read(config.input)
+      bar.log("Loaded metadata from #{config.input}: #{count_files(root)} files")
+      root
+    rescue Errno::ENOENT
+      abort "Error: metadata file not found: #{config.input}"
+    rescue JSON::ParserError => e
+      abort "Error: invalid metadata JSON in #{config.input}: #{e.message}"
+    rescue Metadata::Error => e
+      abort "Error: #{e.message}"
+    end
+
+    def count_files(node)
+      node.file? ? 1 : node.children.sum { |c| count_files(c) }
+    end
+
+    def main(argv)
+      config = Options.parse(argv)
+      http = Http.new(timeout: config.timeout, sleep: config.sleep)
+      bar = StatusBar.new
+      start = Time.now
+
+      root = config.input ? load_metadata(config, bar) : run_stage1(config, http, bar, start)
 
       dest = File.join(config.output, config.project)
       if config.metadata
