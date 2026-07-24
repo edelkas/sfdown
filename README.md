@@ -20,7 +20,7 @@ Arguments:
 
 | Arguments | Default | Description |
 |--|--|--|
-| `-c` or `--concurrent` | 1 | Number of parallel downloads |
+| `-c` or `--concurrent` | 1 | Number of parallel network workers, used in both stages |
 |`-i` or `--input`|None|Bootstrap the download directly from a metadata JSON file, skipping the mapping stage|
 |`-m` or `--metadata`|False|Save metadata to disk at project's root|
 |`-n` or `--no`|False|Only fetch directory tree structure and file metadata, not files|
@@ -28,4 +28,4 @@ Arguments:
 |`-t` or `--timeout`|5|Timeout for each GET request|
 |`-s` or `--sleep`|0|Wait in-between requests|
 
-**Note**: `-c` and `-m` are still unimplemented.
+**Note**: `-s` is applied per worker, so with `-c` the effective request rate scales with the number of workers.

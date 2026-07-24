@@ -4,16 +4,42 @@ require_relative "test_helper"
 
 # Serves canned HTML per directory URL; records which URLs were fetched.
 class FakeHttp
-  attr_reader :gets
-
   def initialize(pages)
     @pages = pages
     @gets = []
+    @mutex = Mutex.new
+  end
+
+  def gets = @mutex.synchronize { @gets.dup }
+
+  def get(url)
+    @mutex.synchronize { @gets << url }
+    @pages.fetch(url) { raise Http::Error, "HTTP 404 for #{url}" }
+  end
+end
+
+# Same, but delays each request and records the peak number of in-flight ones,
+# so worker overlap is observable.
+class TrackingHttp < FakeHttp
+  attr_reader :peak
+
+  def initialize(pages, delay: 0.05)
+    super(pages)
+    @delay = delay
+    @track = Mutex.new
+    @inflight = 0
+    @peak = 0
   end
 
   def get(url)
-    @gets << url
-    @pages.fetch(url) { raise Http::Error, "HTTP 404 for #{url}" }
+    @track.synchronize do
+      @inflight += 1
+      @peak = [@peak, @inflight].max
+    end
+    sleep(@delay)
+    super
+  ensure
+    @track.synchronize { @inflight -= 1 }
   end
 end
 
@@ -78,9 +104,9 @@ class MapperTest < Minitest::Test
     }
   end
 
-  def map(pages)
+  def map(pages, concurrent: 1)
     http = FakeHttp.new(pages)
-    mapper = Mapper.new(PROJECT, http, Parser.new(PROJECT))
+    mapper = Mapper.new(PROJECT, http, Parser.new(PROJECT), concurrent: concurrent)
     root = mapper.map
     [mapper, root, http]
   end
@@ -141,6 +167,40 @@ class MapperTest < Minitest::Test
     assert_match(/failed to map v2\/sub/, err)
     assert_equal 4, mapper.files # d.zip is lost
     assert_empty find(find(root, "v2"), "sub").children
+  end
+
+  # --- concurrency ---
+
+  def test_concurrent_map_yields_the_same_tree
+    _, sequential = map(sample_pages)
+    mapper, parallel, http = map(sample_pages, concurrent: 4)
+    assert_equal Metadata.to_h(sequential), Metadata.to_h(parallel)
+    assert_equal 3, mapper.folders
+    assert_equal 5, mapper.files
+    assert_equal [dir(""), dir("v1"), dir("v2"), dir("v2/sub")].sort, http.gets.sort
+  end
+
+  def test_concurrent_map_survives_failures
+    pages = sample_pages
+    pages.delete(dir("v2/sub"))
+    logged = []
+    mapper = Mapper.new(PROJECT, FakeHttp.new(pages), Parser.new(PROJECT), concurrent: 4, log: ->(m) { logged << m })
+    mapper.map
+    assert_equal 1, mapper.failures
+    assert_equal 1, logged.length
+  end
+
+  # Root has two sibling directories, so with a pool they overlap.
+  def test_workers_fetch_in_parallel
+    http = TrackingHttp.new(sample_pages)
+    Mapper.new(PROJECT, http, Parser.new(PROJECT), concurrent: 4).map
+    assert_operator http.peak, :>=, 2
+  end
+
+  def test_single_worker_never_overlaps
+    http = TrackingHttp.new(sample_pages, delay: 0.01)
+    Mapper.new(PROJECT, http, Parser.new(PROJECT)).map
+    assert_equal 1, http.peak
   end
 
   def test_warnings_go_through_injected_logger

@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here.
 
+## [0.3.0] - 2026-07-24
+
+Added concurrency.
+
+- New option: `-c` / `--concurrent` runs a pool of that many network workers for both stages (mapping directory pages, and downloading files).
+- Children nodes are attached in parse order, so resulting tree and even metadata are identical regardless of concurrency settings.
+
 ## [0.2.0] - 2026-07-23
 
 Added metadata and integrity hashes.
@@ -18,4 +25,4 @@ Initial release.
 - Scrapes the SourceForge "Files" pages with Nokogiri (HTML table + the `net.sf.files` JS metadata object).
 - Preserves file and folder timestamps.
 - Live two-line status bar with per-stage analytics.
-- Options: `-c` concurrency, `-m` metadata, `-n` structure-only, `-o` output, `-t` timeout, `-s` sleep (first two still unimplemented).
+- Options: `-c` concurrency, `-m` metadata, `-n` structure-only, `-o` output, `-t` timeout, `-s` sleep (the first two still unimplemented at this point).

@@ -37,10 +37,11 @@ module Sfdown
     # Build the OptionParser and the options hash it fills.
     def self.parser(opts)
       OptionParser.new do |o|
-        o.banner = "Usage: sfdown project_name [-mn] " \
+        o.banner = "sfdown v#{Sfdown::VERSION} (#{Sfdown::DATE})\n" \
+                   "Usage: sfdown project_name [-mn] " \
                    "[-c concurrent] [-i input] [-o output] [-t timeout] [-s sleep]"
 
-        o.on("-c", "--concurrent N", Integer, "Number of parallel downloads (default 1) (unimplemented)") do |v|
+        o.on("-c", "--concurrent N", Integer, "Number of parallel network workers, both stages (default 1)") do |v|
           raise OptionParser::InvalidArgument, "#{v} (must be >= 1)" if v < 1
 
           opts[:concurrent] = v
@@ -171,6 +172,22 @@ module Sfdown
     end
   end
 
+  # Runs a fixed pool of worker threads over a Queue, one item per call, until
+  # the queue is closed and drained.
+  module Pool
+    module_function
+
+    def run(queue, workers, &blk)
+      Array.new([workers, 1].max) do
+        Thread.new do
+          while (item = queue.pop)
+            blk.call(item)
+          end
+        end
+      end.each(&:join)
+    end
+  end
+
   # Turns a directory page's HTML into child Nodes, merging table rows with
   # the net.sf.files JS object.
   class Parser
@@ -281,30 +298,43 @@ module Sfdown
   end
 
   # Stage 1: walk the directory tree from the root, building the in-memory Node
-  # tree. Network only, never touches the filesystem. Sequential for now
-  # (concurrency arrives in a later milestone).
+  # tree. Network only, never touches the filesystem. Directory pages are fetched
+  # by a pool of `concurrent` workers that enqueue subdirectories as they find
+  # them; counters are mutex-guarded since the progress hook reads them.
   class Mapper
-    attr_reader :folders, :files, :total_size, :failures
-
     # log: callback for non-fatal diagnostics (defaults to stderr; the CLI routes
     # it through StatusBar#log so the bar stays pinned at the bottom).
-    def initialize(project, http, parser, log: ->(m) { warn m })
+    def initialize(project, http, parser, concurrent: 1, log: ->(m) { warn m })
       @project = project
       @http = http
       @parser = parser
+      @concurrent = concurrent
       @log = log
+      @mutex = Mutex.new
+      @queue = Queue.new
+      @pending = 0
       @folders = 0
       @files = 0
       @total_size = 0
       @failures = 0
     end
 
+    def folders = @mutex.synchronize { @folders }
+    def files = @mutex.synchronize { @files }
+    def total_size = @mutex.synchronize { @total_size }
+    def failures = @mutex.synchronize { @failures }
+
     # Build and return the synthetic root Node with the whole tree mapped.
     # Yields each directory Node right after its page is parsed (progress hook).
     def map(&on_page)
       @on_page = on_page
       root = Node.new(name: @project, type: :d, path: "", timestamp: nil, size: 0, downloads: 0, children: [])
-      walk(root)
+      enqueue(root)
+      Pool.run(@queue, @concurrent) do |node|
+        visit(node)
+      ensure
+        finish
+      end
       aggregate(root)
       # Root timestamp isn't provided by SF; use the newest child's.
       root.timestamp = root.children.map(&:timestamp).compact.max
@@ -313,26 +343,43 @@ module Sfdown
 
     private
 
-    def walk(node)
-      begin
-        html = @http.get(Sf.dir_url(@project, node.path))
-        node.children = @parser.parse(html, node.path)
-      rescue Http::Error => e
-        @failures += 1
-        @log.call("WARN: failed to map #{node.path.empty? ? '(root)' : node.path}: #{e.message}")
-        node.children = []
-      end
-      @on_page&.call(node)
+    # Outstanding work is tracked explicitly: an empty queue doesn't mean we're
+    # done (a busy worker may still enqueue children), so the queue is closed
+    # only once the last visit completes, which is what stops the pool.
+    def enqueue(node)
+      @mutex.synchronize { @pending += 1 }
+      @queue << node
+    end
 
-      node.children.each do |child|
-        if child.dir?
-          @folders += 1
-          walk(child)
-        else
-          @files += 1
-          @total_size += child.size
+    def finish
+      @mutex.synchronize do
+        @pending -= 1
+        @queue.close if @pending.zero?
+      end
+    end
+
+    def visit(node)
+      node.children = fetch_children(node)
+      @mutex.synchronize do
+        node.children.each do |child|
+          if child.dir?
+            @folders += 1
+          else
+            @files += 1
+            @total_size += child.size
+          end
         end
       end
+      @on_page&.call(node) # outside the mutex: the hook reads the counters
+      node.children.each { |child| enqueue(child) if child.dir? }
+    end
+
+    def fetch_children(node)
+      @parser.parse(@http.get(Sf.dir_url(@project, node.path)), node.path)
+    rescue Http::Error => e
+      @mutex.synchronize { @failures += 1 }
+      @log.call("WARN: failed to map #{node.path.empty? ? '(root)' : node.path}: #{e.message}")
+      []
     end
 
     # Post-order pass: recompute folder size/downloads from their leaves.
@@ -345,19 +392,20 @@ module Sfdown
     end
   end
 
-  # Stage 2: create the local tree and download files. Counters are mutex-guarded
-  # so a ticker thread can snapshot progress while workers advance it. Sequential
-  # for now (concurrency arrives in a later milestone).
+  # Stage 2: create the local tree and download files with a pool of `concurrent`
+  # workers. Counters are mutex-guarded so the ticker thread can snapshot
+  # progress while the workers advance it.
   class Downloader
     ILLEGAL = /[<>:"\\|?*\x00-\x1f]/.freeze # Windows-illegal chars (per path segment)
 
     attr_reader :total_files, :total_bytes
 
     # dest is the project root directory (<output>/<project>).
-    def initialize(project, http, dest, log: ->(m) { warn m })
+    def initialize(project, http, dest, concurrent: 1, log: ->(m) { warn m })
       @project = project
       @http = http
       @dest = dest
+      @concurrent = concurrent
       @log = log
       @mutex = Mutex.new
       @files = []
@@ -387,8 +435,15 @@ module Sfdown
       @total_bytes = @files.sum(&:size)
     end
 
+    # The work list is fixed here (unlike stage 1), so the queue is filled and
+    # closed up front and workers just drain it.
     def download_all
-      @files.each { |f| download_one(f) }
+      return if @files.empty?
+
+      queue = Queue.new
+      @files.each { |f| queue << f }
+      queue.close
+      Pool.run(queue, [@concurrent, @files.size].min) { |node| download_one(node) }
     end
 
     # Apply folder timestamps last, deepest-first, writing files into a directory
@@ -670,7 +725,7 @@ module Sfdown
     # Stage 1: map the tree over the network, logging the summary.
     def run_stage1(config, http, bar, start)
       parser = Parser.new(config.project)
-      mapper = Mapper.new(config.project, http, parser, log: bar.method(:log))
+      mapper = Mapper.new(config.project, http, parser, concurrent: config.concurrent, log: bar.method(:log))
       root = mapper.map do |node|
         bar.update("Parsing #{node.path}/", stage1_line(mapper, Time.now - start))
       end
@@ -717,7 +772,7 @@ module Sfdown
       end
 
       unless config.no
-        downloader = Downloader.new(config.project, http, dest, log: bar.method(:log))
+        downloader = Downloader.new(config.project, http, dest, concurrent: config.concurrent, log: bar.method(:log))
         run_stage2(downloader, root, bar, start)
       end
 

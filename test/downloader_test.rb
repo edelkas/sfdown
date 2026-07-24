@@ -5,15 +5,16 @@ require "tmpdir"
 
 # Serves canned bytes per download URL, streamed in small chunks; records URLs.
 class FakeDlHttp
-  attr_reader :downloaded
-
   def initialize(by_url)
     @by_url = by_url
     @downloaded = []
+    @mutex = Mutex.new
   end
 
+  def downloaded = @mutex.synchronize { @downloaded.dup }
+
   def download(url, dest)
-    @downloaded << url
+    @mutex.synchronize { @downloaded << url }
     data = @by_url.fetch(url) { raise Http::Error, "HTTP 404 for #{url}" }
     File.open(dest, "wb") do |f|
       data.bytes.each_slice(2) do |slice|
@@ -22,6 +23,30 @@ class FakeDlHttp
         yield chunk if block_given?
       end
     end
+  end
+end
+
+# Same, but delays each download and records the peak number of in-flight ones.
+class TrackingDlHttp < FakeDlHttp
+  attr_reader :peak
+
+  def initialize(by_url, delay: 0.05)
+    super(by_url)
+    @delay = delay
+    @track = Mutex.new
+    @inflight = 0
+    @peak = 0
+  end
+
+  def download(url, dest)
+    @track.synchronize do
+      @inflight += 1
+      @peak = [@peak, @inflight].max
+    end
+    sleep(@delay)
+    super
+  ensure
+    @track.synchronize { @inflight -= 1 }
   end
 end
 
@@ -169,6 +194,68 @@ class DownloaderTest < Minitest::Test
     Dir.mktmpdir do |dir|
       dl = run_download(one_file_tree, FakeDlHttp.new(contents), File.join(dir, PROJECT))
       assert_equal 0, dl.mismatches
+    end
+  end
+
+  # --- concurrency ---
+
+  # A flat tree of n files, so several downloads can be in flight at once.
+  def wide_tree(count)
+    files = (1..count).map { |i| file_node("f#{i}.bin", "f#{i}.bin", T_A, 4) }
+    Node.new(name: PROJECT, type: :d, path: "", timestamp: T_ROOT, size: 0, downloads: 0, children: files)
+  end
+
+  def wide_contents(count) = (1..count).to_h { |i| [Sf.file_url(PROJECT, "f#{i}.bin"), "data#{i}"] }
+
+  def download_wide(http, dest, count, concurrent)
+    dl = Downloader.new(PROJECT, http, dest, concurrent: concurrent)
+    dl.prepare(wide_tree(count))
+    dl.download_all
+    dl
+  end
+
+  def test_concurrent_downloads_write_every_file
+    Dir.mktmpdir do |dir|
+      dest = File.join(dir, PROJECT)
+      dl = download_wide(FakeDlHttp.new(wide_contents(8)), dest, 8, 4)
+      assert_equal 8, dl.files_done
+      assert_equal 0, dl.failures
+      assert_equal (1..8).sum { |i| "data#{i}".bytesize }, dl.bytes_done
+      (1..8).each { |i| assert_equal "data#{i}", File.binread(File.join(dest, "f#{i}.bin")) }
+    end
+  end
+
+  def test_downloads_run_in_parallel
+    Dir.mktmpdir do |dir|
+      http = TrackingDlHttp.new(wide_contents(8))
+      download_wide(http, File.join(dir, PROJECT), 8, 4)
+      assert_operator http.peak, :>=, 2
+    end
+  end
+
+  def test_single_worker_never_overlaps
+    Dir.mktmpdir do |dir|
+      http = TrackingDlHttp.new(wide_contents(4), delay: 0.01)
+      download_wide(http, File.join(dir, PROJECT), 4, 1)
+      assert_equal 1, http.peak
+    end
+  end
+
+  # Pool size is capped at the file count, and an empty work list is a no-op.
+  def test_more_workers_than_files
+    Dir.mktmpdir do |dir|
+      dl = download_wide(FakeDlHttp.new(wide_contents(1)), File.join(dir, PROJECT), 1, 8)
+      assert_equal 1, dl.files_done
+    end
+  end
+
+  def test_no_files_is_a_noop
+    Dir.mktmpdir do |dir|
+      empty = Node.new(name: PROJECT, type: :d, path: "", timestamp: T_ROOT, size: 0, downloads: 0, children: [])
+      dl = Downloader.new(PROJECT, FakeDlHttp.new({}), File.join(dir, PROJECT), concurrent: 4)
+      dl.prepare(empty)
+      dl.download_all
+      assert_equal 0, dl.files_done
     end
   end
 
