@@ -12,6 +12,7 @@ require "time"
 require "digest"
 require "io/console"
 require "fileutils"
+require "set"
 require "nokogiri"
 
 require_relative "sfdown/version"
@@ -19,13 +20,14 @@ require_relative "sfdown/version"
 module Sfdown
   # Parsed CLI configuration.
   Config = Struct.new(
-    :project, :concurrent, :metadata, :no, :input, :output, :timeout, :sleep,
+    :project, :concurrent, :link, :metadata, :no, :input, :output, :timeout, :sleep,
     keyword_init: true
   )
 
   module Options
     DEFAULTS = {
-      concurrent: 1,
+      concurrent: 4,
+      link: false,
       metadata: false,
       no: false,
       input: nil,
@@ -38,15 +40,16 @@ module Sfdown
     def self.parser(opts)
       OptionParser.new do |o|
         o.banner = "sfdown v#{Sfdown::VERSION} (#{Sfdown::DATE})\n" \
-                   "Usage: sfdown project_name [-mn] " \
+                   "Usage: sfdown project_name [-lmn] " \
                    "[-c concurrent] [-i input] [-o output] [-t timeout] [-s sleep]"
 
-        o.on("-c", "--concurrent N", Integer, "Number of parallel network workers, both stages (default 1)") do |v|
+        o.on("-c", "--concurrent N", Integer, "Number of parallel network workers, both stages (default 4)") do |v|
           raise OptionParser::InvalidArgument, "#{v} (must be >= 1)" if v < 1
 
           opts[:concurrent] = v
         end
         o.on("-i", "--input PATH", String, "Bootstrap download from a metadata JSON file (skips mapping)") { |v| opts[:input] = v }
+        o.on("-l", "--link", "Hard-link duplicate files instead of copying them") { opts[:link] = true }
         o.on("-m", "--metadata", "Save metadata JSON file to disk at project's root") { opts[:metadata] = true }
         o.on("-n", "--no", "Only fetch directory tree structure and file metadata, not files") { opts[:no] = true }
         o.on("-o", "--output PATH", String, "Path to store project's root (default current dir)") { |v| opts[:output] = v }
@@ -374,11 +377,13 @@ module Sfdown
       node.children.each { |child| enqueue(child) if child.dir? }
     end
 
+    # One unreachable or unparseable page must not sink the whole walk, so the
+    # rescue is broad; the class name keeps it diagnosable.
     def fetch_children(node)
       @parser.parse(@http.get(Sf.dir_url(@project, node.path)), node.path)
-    rescue Http::Error => e
+    rescue StandardError => e
       @mutex.synchronize { @failures += 1 }
-      @log.call("WARN: failed to map #{node.path.empty? ? '(root)' : node.path}: #{e.message}")
+      @log.call("WARN: failed to map #{node.path.empty? ? '(root)' : node.path}: #{e.class}: #{e.message}")
       []
     end
 
@@ -398,52 +403,61 @@ module Sfdown
   class Downloader
     ILLEGAL = /[<>:"\\|?*\x00-\x1f]/.freeze # Windows-illegal chars (per path segment)
 
-    attr_reader :total_files, :total_bytes
+    attr_reader :total_files, :total_bytes, :duped_bytes
 
     # dest is the project root directory (<output>/<project>).
-    def initialize(project, http, dest, concurrent: 1, log: ->(m) { warn m })
+    def initialize(project, http, dest, concurrent: 1, link: false, log: ->(m) { warn m })
       @project = project
       @http = http
       @dest = dest
       @concurrent = concurrent
+      @link = link
       @log = log
       @mutex = Mutex.new
       @files = []
+      @dupes = []
+      @ok = Set.new
       @total_files = 0
       @total_bytes = 0
+      @duped_bytes = 0
       @files_done = 0
       @bytes_done = 0
+      @duped_files = 0
       @failures = 0
       @mismatches = 0
+      @warned_links = false
       @current = ""
     end
 
     def files_done = @mutex.synchronize { @files_done }
     def bytes_done = @mutex.synchronize { @bytes_done }
+    def duped_files = @mutex.synchronize { @duped_files }
     def failures = @mutex.synchronize { @failures }
     def mismatches = @mutex.synchronize { @mismatches }
     def current = @mutex.synchronize { @current }
 
-    # Create every directory up front and collect the flat file list + totals.
+    # Create every directory up front, then split the files into those to fetch
+    # and the duplicates that will be cloned from them. total_bytes counts only
+    # what will actually cross the network, so the progress bar stays honest.
     def prepare(root)
       FileUtils.mkdir_p(@dest)
+      files = []
       each_node(root) do |n|
         FileUtils.mkdir_p(local_path(n)) if n.dir? && !n.path.empty?
-        @files << n if n.file?
+        files << n if n.file?
       end
-      @total_files = @files.size
+      @total_files = files.size
+      plan(files)
       @total_bytes = @files.sum(&:size)
+      @duped_bytes = @dupes.sum { |node, _| node.size }
     end
 
     # The work list is fixed here (unlike stage 1), so the queue is filled and
-    # closed up front and workers just drain it.
+    # closed up front and workers just drain it. Duplicates come after, once
+    # every original is on disk.
     def download_all
-      return if @files.empty?
-
-      queue = Queue.new
-      @files.each { |f| queue << f }
-      queue.close
-      Pool.run(queue, [@concurrent, @files.size].min) { |node| download_one(node) }
+      run_pool(@files)
+      @dupes.each { |node, source| clone_one(node, source) }
     end
 
     # Apply folder timestamps last, deepest-first, writing files into a directory
@@ -459,6 +473,36 @@ module Sfdown
 
     private
 
+    def run_pool(files)
+      return if files.empty?
+
+      queue = Queue.new
+      files.each { |f| queue << f }
+      queue.close
+      Pool.run(queue, [@concurrent, files.size].min) { |node| download_one(node) }
+    end
+
+    # The first node carrying a given checksum is downloaded; any later node with
+    # the same one is a duplicate of it. Files SF gives no checksum for can't be
+    # deduped, so they're always fetched.
+    def plan(files)
+      sources = {}
+      files.each do |node|
+        key = dedupe_key(node)
+        if (source = key && sources[key])
+          @dupes << [node, source]
+        else
+          sources[key] = node if key
+          @files << node
+        end
+      end
+    end
+
+    def dedupe_key(node)
+      algo, hash = expected_hash(node)
+      algo && "#{algo}:#{hash.downcase}"
+    end
+
     def download_one(node)
       @mutex.synchronize { @current = node.path }
       dest = local_path(node)
@@ -470,10 +514,60 @@ module Sfdown
       end
       File.utime(node.timestamp, node.timestamp, dest) if node.timestamp
       verify(node, digest.hexdigest, expected) if digest
-      @mutex.synchronize { @files_done += 1 }
-    rescue Http::Error => e
+      @mutex.synchronize do
+        @files_done += 1
+        @ok << node.path
+      end
+    rescue StandardError => e
+      # Anything from a timeout to a full disk: warn, drop the partial file so
+      # it can't be mistaken for a good one, and carry on with the rest.
       @mutex.synchronize { @failures += 1 }
-      @log.call("WARN: failed to download #{node.path}: #{e.message}")
+      @log.call("WARN: failed to download #{node.path}: #{e.class}: #{e.message}")
+      FileUtils.rm_f(dest) if dest
+    end
+
+    # A duplicate is cloned from the original's local copy, which was already
+    # verified; a copy or hard link is bit-identical, so there's nothing to
+    # re-check and nothing to re-fetch. Falls back to downloading if the
+    # original never made it.
+    def clone_one(node, source)
+      return download_one(node) unless @mutex.synchronize { @ok.include?(source.path) }
+
+      @mutex.synchronize { @current = node.path }
+      dest = local_path(node)
+      FileUtils.rm_f(dest)
+      linked = clone_file(local_path(source), dest)
+      # Hard links share one inode, so a linked duplicate necessarily shares the
+      # original's timestamps; only a real copy can carry its own.
+      File.utime(node.timestamp, node.timestamp, dest) if node.timestamp && !linked
+      @mutex.synchronize do
+        @files_done += 1
+        @duped_files += 1
+        @ok << node.path
+      end
+    rescue StandardError => e
+      @mutex.synchronize { @failures += 1 }
+      @log.call("WARN: failed to duplicate #{node.path} from #{source.path}: #{e.class}: #{e.message}")
+    end
+
+    # Hard-link when asked, else copy. Links only work within a filesystem (and
+    # not on every one), so fall back to copying and say so once.
+    def clone_file(src, dest)
+      if @link
+        begin
+          File.link(src, dest)
+          return true
+        rescue SystemCallError, NotImplementedError => e
+          warn_no_links(e)
+        end
+      end
+      FileUtils.cp(src, dest)
+      false
+    end
+
+    def warn_no_links(err)
+      warned = @mutex.synchronize { @warned_links.tap { @warned_links = true } }
+      @log.call("WARN: hard links unavailable (#{err.class}: #{err.message}); copying duplicates instead") unless warned
     end
 
     # Strongest available checksum for integrity verification, or nil.
@@ -717,6 +811,9 @@ module Sfdown
       summary = format("Stage 2: %d/%d files, %s in %s (avg %s/s)",
                        downloader.files_done, downloader.total_files,
                        Fmt.size(downloader.bytes_done), Fmt.duration(s2), Fmt.size(avg))
+      if downloader.duped_files.positive?
+        summary += format(" (%d duplicates, %s saved)", downloader.duped_files, Fmt.size(downloader.duped_bytes))
+      end
       summary += " (#{downloader.failures} failures)" if downloader.failures.positive?
       summary += " (#{downloader.mismatches} checksum mismatches)" if downloader.mismatches.positive?
       bar.log(summary)
@@ -772,7 +869,8 @@ module Sfdown
       end
 
       unless config.no
-        downloader = Downloader.new(config.project, http, dest, concurrent: config.concurrent, log: bar.method(:log))
+        downloader = Downloader.new(config.project, http, dest, concurrent: config.concurrent,
+                                                                link: config.link, log: bar.method(:log))
         run_stage2(downloader, root, bar, start)
       end
 

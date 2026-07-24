@@ -11,9 +11,10 @@ Gem::Specification.new do |spec|
   spec.summary     = "SourceForge project downloader."
   spec.description = "Clones a SourceForge project's directory tree and downloads " \
                      "its files by scraping the Files pages (SourceForge has no " \
-                     "official API). Runs in two stages, map the tree, then " \
-                     "download, with a live status bar and optional JSON metadata." \
-                     "Supports concurrency."
+                     "official API). Runs in two stages - map the tree, then " \
+                     "download - with a live status bar and optional JSON metadata. " \
+                     "Supports concurrency, file integrity verification (MD5 / SHA1) " \
+                     "and file deduplication."
   spec.homepage = "https://github.com/edelkas/sfdown"
   spec.license  = "MIT"
   spec.required_ruby_version = ">= 3.0"

@@ -203,6 +203,17 @@ class MapperTest < Minitest::Test
     assert_equal 1, http.peak
   end
 
+  # Not just Http::Error: a page that blows up anywhere is survivable too.
+  def test_unexpected_errors_are_tallied_and_survived
+    exploding = Class.new { def get(_url) = raise(ArgumentError, "bad page") }
+    logged = []
+    mapper = Mapper.new(PROJECT, exploding.new, Parser.new(PROJECT), log: ->(m) { logged << m })
+    root = mapper.map
+    assert_equal 1, mapper.failures
+    assert_empty root.children
+    assert_match(/failed to map \(root\): ArgumentError: bad page/, logged.first)
+  end
+
   def test_warnings_go_through_injected_logger
     pages = sample_pages
     pages.delete(dir("v2/sub"))

@@ -49,6 +49,12 @@ class OptionsTest < Minitest::Test
     assert_equal 2, c.concurrent
   end
 
+  def test_link_option
+    refute Options.parse(["myproject"]).link
+    assert Options.parse(["myproject", "-l"]).link
+    assert Options.parse(["myproject", "--link"]).link
+  end
+
   def test_input_defaults_nil
     assert_nil Options.parse(["myproject"]).input
   end

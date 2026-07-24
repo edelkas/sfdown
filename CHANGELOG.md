@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [0.4.0] - 2026-07-24
+
+Added file deduplication.
+
+- Files that appear more than once in a project (same MD5/SHA1) are downloaded once and copied locally for every further occurrence. Planned before downloading starts, so progress totals only count the bytes that will really be fetched.
+- New option: `-l` / `--link` hard-links duplicates instead of copying them, falling back to a copy (with a warning) where links aren't supported.
+- Stage 2 summary reports how many duplicates were cloned and how many bytes that saved.
+
+Sturdier error handling.
+
+- Failures while mapping a page or downloading a file no longer abort the run when they aren't HTTP errors (unwritable path, full disk, unparseable page), they're warned and tallied instead.
+- A failed download's partial file is now deleted instead of being left on disk.
+
 ## [0.3.0] - 2026-07-24
 
 Added concurrency.
